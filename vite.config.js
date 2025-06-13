@@ -10,6 +10,25 @@ if (isDev) {
 	editModeDevPlugin = (await import('./plugins/visual-editor/vite-plugin-edit-mode.js')).default;
 }
 
+const configHorizonsRuntimeErrorHandler = `
+window.onerror = (message, source, lineno, colno, errorObj) => {
+	const errorDetails = errorObj ? JSON.stringify({
+		name: errorObj.name,
+		message: errorObj.message,
+		stack: errorObj.stack,
+		source,
+		lineno,
+		colno,
+	}) : null;
+
+	window.parent.postMessage({
+		type: 'horizons-runtime-error',
+		message,
+		error: errorDetails
+	}, '*');
+};
+`;
+
 const configHorizonsViteErrorHandler = `
 const observer = new MutationObserver((mutations) => {
 	for (const mutation of mutations) {
@@ -33,58 +52,26 @@ observer.observe(document.documentElement, {
 });
 
 function handleViteOverlay(node) {
-	if (!node.shadowRoot) {
-		return;
-	}
+	if (!node.shadowRoot) return;
 
 	const backdrop = node.shadowRoot.querySelector('.backdrop');
-
 	if (backdrop) {
-		const overlayHtml = backdrop.outerHTML;
 		const parser = new DOMParser();
-		const doc = parser.parseFromString(overlayHtml, 'text/html');
-		const messageBodyElement = doc.querySelector('.message-body');
-		const fileElement = doc.querySelector('.file');
-		const messageText = messageBodyElement ? messageBodyElement.textContent.trim() : '';
-		const fileText = fileElement ? fileElement.textContent.trim() : '';
-		const error = messageText + (fileText ? ' File:' + fileText : '');
-
-		window.parent.postMessage({
-			type: 'horizons-vite-error',
-			error,
-		}, '*');
+		const doc = parser.parseFromString(backdrop.outerHTML, 'text/html');
+		const msg = doc.querySelector('.message-body')?.textContent.trim() || '';
+		const file = doc.querySelector('.file')?.textContent.trim() || '';
+		window.parent.postMessage({ type: 'horizons-vite-error', error: msg + (file ? ' File:' + file : '') }, '*');
 	}
 }
 `;
 
-const configHorizonsRuntimeErrorHandler = `
-window.onerror = (message, source, lineno, colno, errorObj) => {
-	const errorDetails = errorObj ? JSON.stringify({
-		name: errorObj.name,
-		message: errorObj.message,
-		stack: errorObj.stack,
-		source,
-		lineno,
-		colno,
-	}) : null;
-
-	window.parent.postMessage({
-		type: 'horizons-runtime-error',
-		message,
-		error: errorDetails
-	}, '*');
-};
-`;
-
-const configHorizonsConsoleErrroHandler = `
+const configHorizonsConsoleErrorHandler = `
 const originalConsoleError = console.error;
 console.error = function(...args) {
 	originalConsoleError.apply(console, args);
-
 	let errorString = '';
 
-	for (let i = 0; i < args.length; i++) {
-		const arg = args[i];
+	for (const arg of args) {
 		if (arg instanceof Error) {
 			errorString = arg.stack || \`\${arg.name}: \${arg.message}\`;
 			break;
@@ -95,49 +82,27 @@ console.error = function(...args) {
 		errorString = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
 	}
 
-	window.parent.postMessage({
-		type: 'horizons-console-error',
-		error: errorString
-	}, '*');
+	window.parent.postMessage({ type: 'horizons-console-error', error: errorString }, '*');
 };
 `;
 
 const configWindowFetchMonkeyPatch = `
 const originalFetch = window.fetch;
-
 window.fetch = function(...args) {
 	const url = args[0] instanceof Request ? args[0].url : args[0];
+	if (url.startsWith('ws:') || url.startsWith('wss:')) return originalFetch.apply(this, args);
 
-	// Skip WebSocket URLs
-	if (url.startsWith('ws:') || url.startsWith('wss:')) {
-		return originalFetch.apply(this, args);
-	}
-
-	return originalFetch.apply(this, args)
-		.then(async response => {
-			const contentType = response.headers.get('Content-Type') || '';
-
-			// Exclude HTML document responses
-			const isDocumentResponse =
-				contentType.includes('text/html') ||
-				contentType.includes('application/xhtml+xml');
-
-			if (!response.ok && !isDocumentResponse) {
-					const responseClone = response.clone();
-					const errorFromRes = await responseClone.text();
-					const requestUrl = response.url;
-					console.error(\`Fetch error from \${requestUrl}: \${errorFromRes}\`);
-			}
-
-			return response;
-		})
-		.catch(error => {
-			if (!url.match(/\.html?$/i)) {
-				console.error(error);
-			}
-
-			throw error;
-		});
+	return originalFetch.apply(this, args).then(async res => {
+		const type = res.headers.get('Content-Type') || '';
+		if (!res.ok && !type.includes('text/html') && !type.includes('application/xhtml+xml')) {
+			const txt = await res.clone().text();
+			console.error(\`Fetch error from \${res.url}: \${txt}\`);
+		}
+		return res;
+	}).catch(err => {
+		if (!url.match(/\\.html?$/i)) console.error(err);
+		throw err;
+	});
 };
 `;
 
@@ -147,55 +112,31 @@ const addTransformIndexHtml = {
 		return {
 			html,
 			tags: [
-				{
-					tag: 'script',
-					attrs: { type: 'module' },
-					children: configHorizonsRuntimeErrorHandler,
-					injectTo: 'head',
-				},
-				{
-					tag: 'script',
-					attrs: { type: 'module' },
-					children: configHorizonsViteErrorHandler,
-					injectTo: 'head',
-				},
-				{
-					tag: 'script',
-					attrs: {type: 'module'},
-					children: configHorizonsConsoleErrroHandler,
-					injectTo: 'head',
-				},
-				{
-					tag: 'script',
-					attrs: { type: 'module' },
-					children: configWindowFetchMonkeyPatch,
-					injectTo: 'head',
-				},
+				{ tag: 'script', attrs: { type: 'module' }, children: configHorizonsRuntimeErrorHandler, injectTo: 'head' },
+				{ tag: 'script', attrs: { type: 'module' }, children: configHorizonsViteErrorHandler, injectTo: 'head' },
+				{ tag: 'script', attrs: { type: 'module' }, children: configHorizonsConsoleErrorHandler, injectTo: 'head' },
+				{ tag: 'script', attrs: { type: 'module' }, children: configWindowFetchMonkeyPatch, injectTo: 'head' },
 			],
 		};
 	},
 };
 
 console.warn = () => {};
-
-const logger = createLogger()
-const loggerError = logger.error
-
+const logger = createLogger();
+const loggerError = logger.error;
 logger.error = (msg, options) => {
-	if (options?.error?.toString().includes('CssSyntaxError: [postcss]')) {
-		return;
+	if (!options?.error?.toString().includes('CssSyntaxError: [postcss]')) {
+		loggerError(msg, options);
 	}
-
-	loggerError(msg, options);
-}
+};
 
 export default defineConfig({
-	 base: '/Custom_Crafts_Apk/',
+	base: '/Custom_Crafts_Apk/',
 	customLogger: logger,
 	plugins: [
 		...(isDev ? [inlineEditPlugin(), editModeDevPlugin()] : []),
 		react(),
-		addTransformIndexHtml
+		addTransformIndexHtml,
 	],
 	server: {
 		cors: true,
@@ -205,7 +146,7 @@ export default defineConfig({
 		allowedHosts: true,
 	},
 	resolve: {
-		extensions: ['.jsx', '.js', '.tsx', '.ts', '.json', ],
+		extensions: ['.jsx', '.js', '.tsx', '.ts', '.json'],
 		alias: {
 			'@': path.resolve(__dirname, './src'),
 		},
